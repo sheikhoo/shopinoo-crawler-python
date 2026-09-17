@@ -1,0 +1,15 @@
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.log
+.pytest_cache/
+.mypy_cache/
+.seen/
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
