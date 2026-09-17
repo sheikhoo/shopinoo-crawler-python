@@ -1,1 +1,0 @@
-# shopinoo-crawler-python
