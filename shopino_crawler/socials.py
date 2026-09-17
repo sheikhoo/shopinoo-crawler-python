@@ -66,6 +66,25 @@ def _normalize_social_url(url: str) -> str:
     return url.split("#")[0].rstrip("/")
 
 
+def non_website_socials(links: list[dict[str, str]] | None) -> list[dict[str, str]]:
+    """لینک‌هایی غیر از خود وب‌سایت فروشگاه (اینستا، تلگرام، …)."""
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for link in links or []:
+        platform = str(link.get("platform") or "").strip().lower()
+        url = str(link.get("url") or "").strip()
+        if not platform or not url:
+            continue
+        if platform in {"website", "web", "site"}:
+            continue
+        key = f"{platform}:{url}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(link)
+    return out
+
+
 def extract_social_links(html: str, base_url: str = "") -> list[dict[str, str]]:
     """
     استخراج هوشمند شبکه‌های اجتماعی از:

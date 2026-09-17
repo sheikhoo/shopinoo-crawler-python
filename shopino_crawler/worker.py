@@ -7,12 +7,12 @@ from .config import config
 from .discover import discover_domains_from_html, is_shop_candidate
 from .extract import extract_public_business, merge_extractions
 from .fetch import fetch_public, is_allowed
-from .normalize import normalize_domain
+from .normalize import has_persian_text, normalize_domain
 from .pages import build_crawl_targets
 from .publish import publish_business
 from .queue import create_queue
 from .render import render_with_playwright
-from .socials import extract_social_links
+from .socials import extract_social_links, non_website_socials
 from .assets import harvest_socials_from_assets
 
 
@@ -74,6 +74,11 @@ def crawl_domain(domain: str, seed_name: str | None, enqueue) -> dict | None:
         print(f"[skip] invalid domain: {domain}", flush=True)
         return None
 
+    # دامنهٔ ایگنور/بلاک‌لیست → هیچ لینک داخلی یا خارجی را ادامه نده
+    if not is_shop_candidate(host):
+        print(f"[skip] ignored domain: {host}", flush=True)
+        return None
+
     print(f"[crawl] start {host}", flush=True)
     print(f"[crawl] robots {host} …", flush=True)
     if not is_allowed(host, "/"):
@@ -126,12 +131,22 @@ def crawl_domain(domain: str, seed_name: str | None, enqueue) -> dict | None:
         else:
             print(f"[render] fail {rendered.get('error')}", flush=True)
 
+    # بدون فارسی در صفحه اول → سایت ایگنور؛ لینک‌های داخلش را دنبال نکن
+    if home_html and not has_persian_text(home_html):
+        print(f"[gate] no persian text — skip {host} (no link expand)", flush=True)
+        return None
+
+    if not home_html:
+        print(f"[empty] no homepage for {host}", flush=True)
+        return None
+
     max_pages = max(config.max_pages_per_domain, 8)
     targets = build_crawl_targets(host, home_html, home_final, max_pages)
     print(f"[targets] {host} → {len(targets)} pages", flush=True)
 
     parts: list[dict] = []
-    total_expanded = 0
+    # صفحات برای expand فقط بعد از قبول‌شدن سایت استفاده می‌شوند
+    expand_pages: list[tuple[str, str]] = []
     did_home = False
 
     for url in targets:
@@ -147,28 +162,43 @@ def crawl_domain(domain: str, seed_name: str | None, enqueue) -> dict | None:
             if not did_home:
                 did_home = True
                 parts.append(extract_public_business(home_html, home_final, host))
-                total_expanded += expand_from_html(home_html, home_final, host, enqueue)
+                expand_pages.append((home_html, home_final))
             continue
 
         res = fetch_public(url)
         if not res.get("ok") or not res.get("html"):
             print(f"[fetch] {res.get('status')} {url}")
             continue
-        extracted = extract_public_business(res["html"], res.get("url") or url, host)
+        page_html = res["html"]
+        page_url = res.get("url") or url
+        extracted = extract_public_business(page_html, page_url, host)
         parts.append(extracted)
-        print(f"[ok] {res.get('url')} → {extracted.get('name')}")
-        total_expanded += expand_from_html(
-            res["html"], res.get("url") or url, host, enqueue
-        )
-
-    if total_expanded:
-        print(f"[expand] {host} → +{total_expanded} domains")
+        expand_pages.append((page_html, page_url))
+        print(f"[ok] {page_url} → {extracted.get('name')}")
 
     if not parts and home_html:
         parts.append(extract_public_business(home_html, home_final, host))
+        expand_pages.append((home_html, home_final))
 
     if not parts:
-        print(f"[empty] no public pages for {host}")
+        print(f"[empty] no public pages for {host}", flush=True)
+        return None
+
+    # بدون متن فارسی کافی → احتمالاً سایت ایرانی نیست
+    has_fa = has_persian_text(home_html)
+    if not has_fa:
+        has_fa = any(
+            has_persian_text(
+                " ".join(
+                    str(part.get(k) or "")
+                    for k in ("name", "description", "address", "city")
+                ),
+                min_chars=8,
+            )
+            for part in parts
+        )
+    if not has_fa:
+        print(f"[gate] no persian text — skip {host} (no link expand)", flush=True)
         return None
 
     merged = merge_extractions(parts, host, home_final)
@@ -176,13 +206,30 @@ def crawl_domain(domain: str, seed_name: str | None, enqueue) -> dict | None:
         merged["name"] = seed_name
 
     if not merged.get("name") or not merged.get("canonicalDomain"):
-        print(f"[gate] missing name/domain for {host}")
+        print(f"[gate] missing name/domain for {host} (no link expand)", flush=True)
         return None
+
+    socials = non_website_socials(merged.get("socialLinks") or [])
+    merged["socialLinks"] = socials
+    if not socials:
+        print(
+            f"[gate] no social links (besides website) — skip {host} (no link expand)",
+            flush=True,
+        )
+        return None
+
+    # فقط سایت‌های قبول‌شده: لینک‌های داخلشان را برای کشف دامنه ادامه بده
+    total_expanded = 0
+    for page_html, page_url in expand_pages:
+        total_expanded += expand_from_html(page_html, page_url, host, enqueue)
+    if total_expanded:
+        print(f"[expand] {host} → +{total_expanded} domains")
 
     result = publish_business(merged)
     print(
         f"[ingest] {result.get('action')} {result.get('slug')} "
-        f"({result.get('canonicalDomain')})"
+        f"({result.get('canonicalDomain')}) socials={len(socials)}",
+        flush=True,
     )
     return result
 

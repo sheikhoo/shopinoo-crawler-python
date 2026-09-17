@@ -10,11 +10,12 @@ from bs4 import BeautifulSoup
 from .normalize import (
     absolute_url,
     clean_shop_name,
+    is_generic_page_title,
     normalize_phone,
     to_english_digits,
 )
 from .pages import classify_page_kind
-from .socials import extract_social_links
+from .socials import extract_social_links, non_website_socials
 from .souputil import make_soup
 
 
@@ -171,10 +172,13 @@ def _page_bonus(kind: str, field: str) -> float:
     """صفحه تماس برای تلفن/ایمیل/آدرس ارزش بیشتری دارد."""
     if kind == "contact" and field in {"phone", "email", "address", "city"}:
         return 0.15
-    if kind == "about" and field in {"description", "name"}:
+    if kind == "about" and field in {"description"}:
         return 0.1
+    # نام فروشگاه فقط از صفحه اصلی قابل‌اعتماد است
     if kind == "home" and field in {"logo", "coverImage", "name"}:
-        return 0.05
+        return 0.2
+    if kind != "home" and field == "name":
+        return -0.35
     return 0.0
 
 
@@ -195,6 +199,20 @@ def extract_public_business(html: str, page_url: str, domain: str) -> dict[str, 
     # اگر title طولانی سئو است و og:site_name نبود، نام کوتاه‌تر از JSON-LD یا دامنه
     if title and len(title) > 40 and json_ld.get("name"):
         title = str(json_ld["name"])
+
+    # در صفحات درباره/تماس، title صفحه را به‌عنوان نام فروشگاه نگیر
+    name_raw = json_ld.get("name")
+    if kind == "home":
+        name_raw = (
+            _meta(soup, "og:site_name")
+            or json_ld.get("name")
+            or _meta(soup, "application-name")
+            or title
+        )
+    elif is_generic_page_title(clean_shop_name(title, domain)):
+        name_raw = json_ld.get("name")  # فقط JSON-LD؛ وگرنه merge از home می‌گیرد
+    else:
+        name_raw = json_ld.get("name") or _meta(soup, "og:site_name")
     description = (
         _meta(soup, "og:description", "description", "twitter:description")
         or json_ld.get("description")
@@ -268,7 +286,13 @@ def extract_public_business(html: str, page_url: str, domain: str) -> dict[str, 
     if hm:
         hours = hm.group(1).strip()
 
-    name = clean_shop_name(json_ld.get("name") or title, domain)
+    name = clean_shop_name(name_raw, domain) if name_raw else ""
+    if name and is_generic_page_title(name):
+        name = ""
+    if kind == "home" and not name:
+        name = clean_shop_name(title, domain)
+        if is_generic_page_title(name):
+            name = domain
     category_hint = _guess_category(f"{name} {description or ''} {text[:2000]}")
 
     now = datetime.now(timezone.utc).isoformat()
@@ -277,7 +301,9 @@ def extract_public_business(html: str, page_url: str, domain: str) -> dict[str, 
     def mark(field: str, value: Any, source: str, confidence: float) -> None:
         if value is None or value == "":
             return
-        conf = min(1.0, confidence + _page_bonus(kind, field))
+        if field == "name" and is_generic_page_title(str(value)):
+            return
+        conf = min(1.0, max(0.0, confidence + _page_bonus(kind, field)))
         field_sources[field] = {
             "value": str(value),
             "source": source,
@@ -287,7 +313,13 @@ def extract_public_business(html: str, page_url: str, domain: str) -> dict[str, 
             "pageKind": kind,
         }
 
-    mark("name", name, "json-ld" if json_ld.get("name") else "html-title", 0.85)
+    if name:
+        mark(
+            "name",
+            name,
+            "json-ld" if json_ld.get("name") else "html-title",
+            0.9 if kind == "home" else 0.45,
+        )
     mark("description", description, "meta", 0.7)
     mark("logo", logo, "json-ld" if json_ld.get("logo") else "html", 0.75)
     mark("coverImage", cover, "og", 0.7)
@@ -299,7 +331,7 @@ def extract_public_business(html: str, page_url: str, domain: str) -> dict[str, 
     mark("categoryHint", category_hint, "heuristic", 0.45)
 
     return {
-        "name": name,
+        "name": name or None,
         "description": (description or "")[:2000] or None,
         "logo": logo,
         "coverImage": cover,
@@ -351,16 +383,38 @@ def merge_extractions(
         "categoryHint",
     ]
 
+    # نام را اول از صفحه اصلی بگیر
+    home_name = None
+    home_name_meta: dict[str, Any] = {}
+    for part in parts:
+        if not part or part.get("pageKind") != "home":
+            continue
+        candidate = part.get("name")
+        if candidate and not is_generic_page_title(str(candidate)):
+            home_name = candidate
+            home_name_meta = (part.get("fieldSources") or {}).get("name") or {
+                "pageKind": "home",
+                "confidence": 0.95,
+                "source": "homepage",
+            }
+            break
+
     for part in parts:
         if not part:
             continue
         sources = part.get("fieldSources") or {}
         for field in fields:
+            if field == "name" and home_name:
+                continue
             value = part.get(field)
             if not value:
                 continue
+            if field == "name" and is_generic_page_title(str(value)):
+                continue
             meta = sources.get(field) or {}
             conf = float(meta.get("confidence") or part.get("confidence") or 0.5)
+            if field == "name" and meta.get("pageKind") == "home":
+                conf += 0.25
             prev = best.get(field)
             if prev is None or conf > prev[0]:
                 best[field] = (conf, value, meta)
@@ -372,22 +426,28 @@ def merge_extractions(
             social_seen.add(key)
             merged["socialLinks"].append(link)
 
-        merged["confidence"] = max(merged["confidence"], float(part.get("confidence") or 0))
+        merged["confidence"] = max(
+            merged["confidence"], float(part.get("confidence") or 0)
+        )
 
     for field, (_conf, value, meta) in best.items():
         merged[field] = value
         if meta:
             merged["fieldSources"][field] = meta
 
-    if not merged.get("name"):
+    if home_name:
+        merged["name"] = home_name
+        merged["fieldSources"]["name"] = home_name_meta
+
+    if not merged.get("name") or is_generic_page_title(str(merged.get("name"))):
         merged["name"] = domain
 
-    # categorySlug فقط اگر ingest پشتیبانی کند — به‌صورت hint در keywords هم بفرست
+    # فقط سوشال‌های غیر از website در خروجی بمانند (+ website جدا در ingest)
+    merged["socialLinks"] = non_website_socials(merged.get("socialLinks") or [])
+
     hint = merged.pop("categoryHint", None)
     if hint:
         merged["keywords"] = list({hint, *(merged.get("keywords") or [])})[:10]
-        # اگر بک‌اند categorySlug داشته باشد می‌تواند استفاده کند
         merged["categorySlug"] = hint
 
-    # پاکسازی None
     return {k: v for k, v in merged.items() if v is not None}

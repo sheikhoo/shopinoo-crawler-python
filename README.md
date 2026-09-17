@@ -56,3 +56,4 @@ python -m shopino_crawler --seed-only
 - Rate limit per host
 - User-Agent: `ShopinoBot/1.0 (+https://shopinoo-plus.ir/bot)`
 - بدون login و بدون دور زدن دسترسی
+- سایت ایگنور/ردشده: لینک‌های داخلش کشف و صف نمی‌شوند

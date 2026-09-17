@@ -72,6 +72,47 @@ def clean_shop_name(raw: str | None, domain: str) -> str:
     for pat in junk:
         name = re.sub(pat, " ", name, flags=re.I).strip()
     name = re.sub(r"\s+", " ", name).strip(" -–—|·•")
-    if len(name) < 2:
+    if len(name) < 2 or is_generic_page_title(name):
         name = domain
     return name[:120]
+
+
+_GENERIC_PAGE_TITLES = re.compile(
+    r"^(?:"
+    r"درباره\s*ما|درباره|تماس\s*با\s*ما|تماس|ارتباط\s*با\s*ما|"
+    r"قوانین|حریم\s*خصوصی|سوالات\s*متداول|فاکتور|سبد\s*خرید|"
+    r"ورود|ثبت\s*نام|حساب\s*کاربری|بلاگ|مقالات|محصولات|فروشگاه|"
+    r"صفحه\s*اصلی|خانه|"
+    r"about(?:\s*us)?|contact(?:\s*us)?|privacy(?:\s*policy)?|"
+    r"terms(?:\s*&?\s*conditions)?|faq|blog|home|shop|products|"
+    r"login|sign\s*up|cart|checkout"
+    r")$",
+    re.I,
+)
+
+
+def is_generic_page_title(name: str | None) -> bool:
+    """عنوان‌هایی مثل «درباره ما» که نام فروشگاه نیستند."""
+    cleaned = to_english_digits(name or "").strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned:
+        return True
+    return bool(_GENERIC_PAGE_TITLES.match(cleaned))
+
+
+_PERSIAN_CHAR = re.compile(r"[\u0600-\u06FF]")
+
+
+def has_persian_text(html_or_text: str | None, *, min_chars: int = 25) -> bool:
+    """اگر متن فارسی کافی نباشد، احتمالاً سایت ایرانی نیست."""
+    if not html_or_text:
+        return False
+    # اسکریپت/استایل را ساده حذف کن تا نویز کمتر شود
+    text = re.sub(
+        r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>",
+        " ",
+        html_or_text,
+    )
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    chars = _PERSIAN_CHAR.findall(text)
+    return len(chars) >= min_chars
